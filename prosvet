@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Prosvet - DPI-bypass manager: picks a working strategy for your ISP (engine: byedpi)."""
+import argparse, json, os, shutil, signal, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VERSION = "0.1.0"
+CONF = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "prosvet"
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "prosvet"
+CFG, PID = CONF / "config.json", DATA / "engine.pid"
+ENGINE_DIR = DATA / "byedpi"
+
+DEFAULT = {
+    "port": 1080,
+    "strategy": None,
+    "targets": ["https://www.youtube.com", "https://discord.com", "https://x.com",
+                "https://www.instagram.com", "https://www.wikipedia.org"],
+    # starting points, tune per ISP (see byedpi README for all flags)
+    "strategies": [
+        ["-s1"], ["-d1"], ["-o1"], ["-r1+s"],
+        ["-s1", "-r1+s"], ["-d1", "-r1+s"], ["-o1", "-d1", "-r1+s"], ["-f-1", "-t8"],
+    ],
+}
+
+
+def cfg():
+    CONF.mkdir(parents=True, exist_ok=True)
+    if not CFG.exists():
+        CFG.write_text(json.dumps(DEFAULT, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {**DEFAULT, **json.loads(CFG.read_text(encoding="utf-8"))}
+
+
+def save(c):
+    CFG.write_text(json.dumps(c, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def engine():
+    p = shutil.which("ciadpi") or (ENGINE_DIR / "ciadpi")
+    if not Path(p).exists():
+        sys.exit("engine not found, run: prosvet install-engine")
+    return str(p)
+
+
+def install_engine():
+    DATA.mkdir(parents=True, exist_ok=True)
+    if not ENGINE_DIR.exists():
+        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/hufrea/byedpi", str(ENGINE_DIR)])
+    subprocess.check_call(["make", "-C", str(ENGINE_DIR)])
+    print("+ engine built:", ENGINE_DIR / "ciadpi")
+
+
+def probe(url, port=None):
+    cmd = ["curl", "-s", "-o", "/dev/null", "-m", "7", "-w", "%{http_code}"]
+    if port:
+        cmd += ["--socks5-hostname", f"127.0.0.1:{port}"]
+    try:
+        out = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=12).stdout.strip()
+    except subprocess.TimeoutExpired:
+        return False
+    return out not in ("", "000")
+
+
+def check(targets, port=None):
+    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+        return dict(zip(targets, ex.map(lambda t: probe(t, port), targets)))
+
+
+def spawn(args, port):
+    return subprocess.Popen([engine(), "-i", "127.0.0.1", "-p", str(port), *args],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def running():
+    try:
+        pid = int(PID.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def show(res):
+    for t, ok in res.items():
+        print(("  \033[32m+\033[0m " if ok else "  \033[31m-\033[0m ") + t)
+
+
+def cmd_test():
+    c = cfg()
+    print("direct:")
+    show(check(c["targets"]))
+    if running():
+        print(f"via proxy 127.0.0.1:{c['port']}:")
+        show(check(c["targets"], c["port"]))
+    else:
+        print("(proxy is not running: prosvet start)")
+
+
+def cmd_auto():
+    c = cfg()
+    best, best_score = None, -1
+    for s in c["strategies"]:
+        p = spawn(s, c["port"])
+        time.sleep(0.6)
+        res = check(c["targets"], c["port"])
+        p.terminate()
+        sc = sum(res.values())
+        print(f"{sc}/{len(res)}  {' '.join(s)}")
+        if sc > best_score:
+            best, best_score = s, sc
+        if sc == len(res):
+            break
+        time.sleep(0.3)
+    if best is None or best_score == 0:
+        sys.exit("no strategy worked: edit strategies in " + str(CFG))
+    c["strategy"] = best
+    save(c)
+    print(f"\n+ best strategy: {' '.join(best)} ({best_score}/{len(c['targets'])}), saved. Run: prosvet start")
+
+
+def cmd_start():
+    c = cfg()
+    if running():
+        return print("already running")
+    if not c["strategy"]:
+        sys.exit("no strategy yet, run: prosvet auto")
+    DATA.mkdir(parents=True, exist_ok=True)
+    p = spawn(c["strategy"], c["port"])
+    PID.write_text(str(p.pid))
+    print(f"+ started. SOCKS5 proxy: 127.0.0.1:{c['port']}  (strategy: {' '.join(c['strategy'])})")
+
+
+def cmd_stop():
+    pid = running()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        PID.unlink(missing_ok=True)
+        print("stopped")
+    else:
+        print("not running")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="prosvet", description="Prosvet - DPI-bypass manager (byedpi)")
+    ap.add_argument("-v", "--version", action="version", version=f"prosvet {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for n, h in [("install-engine", "download and build byedpi"), ("test", "check which sites open"),
+                 ("auto", "find the best strategy for your ISP"), ("start", "start local SOCKS5 proxy"),
+                 ("stop", "stop it"), ("status", "show state")]:
+        sub.add_parser(n, help=h)
+    a = ap.parse_args()
+    {"install-engine": install_engine, "test": cmd_test, "auto": cmd_auto,
+     "start": cmd_start, "stop": cmd_stop,
+     "status": lambda: print("running" if running() else "stopped", "|", cfg()["strategy"])}[a.cmd]()
+
+
+if __name__ == "__main__":
+    main()
