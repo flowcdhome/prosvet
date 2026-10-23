@@ -4,7 +4,7 @@ import argparse, json, os, shutil, signal, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CONF = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "prosvet"
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "prosvet"
 CFG, PID = CONF / "config.json", DATA / "engine.pid"
@@ -95,8 +95,12 @@ def cmd_test():
         print("(proxy is not running: prosvet start)")
 
 
-def cmd_auto():
+def cmd_auto(force=False):
     c = cfg()
+    if not force and all(check(c['targets']).values()):
+        print('No blocking detected: every test site opens directly.')
+        print('Turn off your VPN (it hides blocks) or use --force to pick a strategy anyway.')
+        return
     best, best_score = None, -1
     for s in c["strategies"]:
         p = spawn(s, c["port"])
@@ -146,9 +150,11 @@ def main():
     for n, h in [("install-engine", "download and build byedpi"), ("test", "check which sites open"),
                  ("auto", "find the best strategy for your ISP"), ("start", "start local SOCKS5 proxy"),
                  ("stop", "stop it"), ("status", "show state")]:
-        sub.add_parser(n, help=h)
+        sp = sub.add_parser(n, help=h)
+        if n == 'auto':
+            sp.add_argument('--force', action='store_true', help='skip the direct-access check')
     a = ap.parse_args()
-    {"install-engine": install_engine, "test": cmd_test, "auto": cmd_auto,
+    {"install-engine": install_engine, "test": cmd_test, "auto": lambda: cmd_auto(a.force),
      "start": cmd_start, "stop": cmd_stop,
      "status": lambda: print("running" if running() else "stopped", "|", cfg()["strategy"])}[a.cmd]()
 
